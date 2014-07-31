@@ -1,0 +1,209 @@
+<html>
+<head>
+<script type="text/javascript" src="d3.v3.min.js"></script>
+<script type="text/javascript" src="numeric-1.2.6.min.js"></script>
+<script type="text/javascript" src="xregexp-all-min.js"></script>
+<script type="text/javascript" src="lbfgs.js"></script>
+<link href='http://fonts.googleapis.com/css?family=Open+Sans|Old+Standard+TT' rel='stylesheet' type='text/css'>
+<style>
+body { font-family: "Open Sans"; }
+line.guide { stroke: #eeeeee; opacity: 0.0; }
+rect { fill: none; pointer-events: all; }
+#modal { visibility: hidden; position: absolute; left: 0px; top: 0px; background: rgba(200,200,200,0.3);
+	 min-height: 100%; width: 100%; text-align: center; z-index: 1000; }
+#docs { width: 80%; background-color: #ffffff; margin: 20 100 100 100; padding: 10;}
+#close { float: right; font-size: x-large; width: 30; height: 30; background-color: #ccc; cursor: pointer;}
+#labels { font-weight: bold; }
+#words { font-size: x-small; margin: 10 60 10 60; }
+.doc { margin: 10 50 10 50; text-align: justify; font-family: "Old Standard TT", Times;}
+</style>
+</head>
+<body>
+	<div id="modal"><div id="docs">
+		<div id="close">&times;</div>
+		<div id="labels"></div>
+    	<div id="words"></div>
+	</div></div>
+	
+	<div id="doc"></div>
+	<div id="word"></div>
+	<div id="log"></div>
+	
+<script>
+
+var labels = [];
+
+var labelIDs = d3.map();
+var words = [];
+var wordIDs = d3.map();
+
+var wordLabelCounts = {};
+var wordLabelNonZeros = {};
+var labelSums = {};
+var smoothing = 0.01;
+var logSmoothing = Math.log(smoothing);
+
+var documents = [];
+
+var stopwords = {};
+
+var confusion;
+
+var wordPattern = XRegExp("\\p{L}[\\p{L}\\p{P}]*\\p{L}", "g");
+
+d3.select("#close")
+.on("click", function () { d3.select("#modal").style("visibility", "hidden"); });
+
+function getLabelID(label) {
+	if (! labelIDs.has(label)) {
+		var labelID = labels.length;
+		labels.push(label);
+		labelIDs.set(label, labelID);
+		labelSums[labelID] = 0;
+	}
+	
+	return labelIDs.get(label);
+}
+
+function getWordID(word) {
+	if (! wordIDs.has(word)) {
+		var wordID = words.length;
+		words.push(word);
+		wordIDs.set(word, wordID);
+		wordLabelCounts[wordID] = {};
+		wordLabelNonZeros[wordID] = [];
+	}
+	
+	return wordIDs.get(word);
+}
+
+function parseLine( fields, row ) {
+	// If it's not in [ID]\t[TAG]\t[TEXT] format...
+	if (fields.length != 3) { /* error! */ return; }
+
+	var docID = fields[0];
+	var labelID = getLabelID(fields[1]); // interpret as a number
+	text = fields[2].replace(/\\n/g, " ");
+
+	var tokens = [];
+	var rawTokens = text.toLowerCase().match(wordPattern);
+	if (rawTokens == null) { return; }
+
+	var wordID;
+
+	rawTokens.forEach(function (word) {
+		if (word !== "" && ! stopwords[word] && word.length > 2) {
+			wordID = getWordID(word);
+			var counts = wordLabelCounts[wordID];
+			if (! counts.hasOwnProperty(labelID)) {
+				counts[labelID] = 0;
+				wordLabelNonZeros[wordID].push(labelID);
+			}
+			counts[labelID] += 1;
+			labelSums[labelID] += 1;
+			tokens.push(wordID);
+		}
+	});
+
+	return { "originalOrder" : row, "id" : docID, "labelID" : labelID, "originalText" : text, "tokens" : tokens };
+};
+
+function logSumExp(x) {
+	var max = d3.max(x);
+	var sum = 0.0;
+	for (var i = 0; i < x.length; i++) {
+		if (x[i] - max > -10) {
+			sum += Math.exp(x[i] - max);
+		}
+	}
+	return Math.log(sum) + max;
+}
+
+var optimizable;
+var maxent;
+
+d3.text("input.txt", 
+function (error, text) {
+	console.log("got docs");
+	var start = +new Date();
+	documents = d3.tsv.parseRows(text, parseLine);
+	var end = +new Date();
+	console.log("parsed " + (end - start));
+		
+	
+	start = +new Date();
+	
+	optimizable = {
+		getValue: function (parameters) {
+			//console.log("Value");
+			var logLikelihood = 0.0;
+			documents.forEach(function (doc, i) {
+				var labelWeights = numeric.rep([labels.length], 0.0);
+				doc.tokens.forEach(function (wordID) {
+					for (var labelID = 0; labelID < labels.length; labelID++) {
+						labelWeights[labelID] += parameters[words.length * labelID + wordID];
+					}
+				});
+				logLikelihood += labelWeights[doc.labelID] - logSumExp(labelWeights);
+			});
+			
+			parameters.forEach(function (x) {
+				logLikelihood -= 0.5 * x * x; // prior precision 0.1 = variance 10.0
+			});
+			
+			return logLikelihood;
+		},
+		
+		getGradient: function (parameters, gradient) {
+			//console.log("Gradient");
+
+			parameters.forEach(function (x, i) {
+				gradient[i] = -1.0 * x; // prior precision 0.1 = variance 10.0
+			});
+			
+			documents.forEach(function (doc, i) {
+				var labelWeights = numeric.rep([labels.length], 0.0);
+				doc.tokens.forEach(function (wordID) {
+					for (var labelID = 0; labelID < labels.length; labelID++) {
+						labelWeights[labelID] += parameters[words.length * labelID + wordID];
+					}
+				});
+				
+				// Make the largest weight == 0, to keep the exponentiation from blowing up
+				var max = d3.max(labelWeights);
+				
+				// Selectively exponentiate and add up the results
+				var sum = 0.0;
+				for (var labelID = 0; labelID < labels.length; labelID++) {
+					if (labelWeights[labelID] - max > -10) {
+						labelWeights[labelID] = Math.exp(labelWeights[labelID] - max);
+						sum += labelWeights[labelID];
+					}
+					else {
+						labelWeights[labelID] = 0.0;
+					}
+				}
+				
+				numeric.muleq(labelWeights, 1.0 / sum);
+				
+				doc.tokens.forEach(function (wordID) {
+					for (var labelID = 0; labelID < labels.length; labelID++) {
+						gradient[words.length * labelID + wordID] += (labelID === doc.labelID ? 1.0 : 0.0) - labelWeights[labelID];
+					}
+				});
+			});
+						
+			return gradient;
+		}
+	};
+	
+	maxent = numeric.rep([labels.length * words.length], 0.0)
+	limitedMemoryBFGS(optimizable, maxent);
+	
+	end = +new Date();
+	console.log("classified " + (end - start));
+});
+
+</script>
+</body>
+</html>

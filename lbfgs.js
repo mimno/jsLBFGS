@@ -220,7 +220,7 @@ function backtrackingLineSearch(optimizable, direction, gradient, parameters) {
 			newScale = 0.2 * scale;
 		}
 		else {
-			if (scale = 1.0) {
+			if (scale == 1.0) {
 				// This is only true if this is the first iteration (?)
 				newScale = -slope / (2.0 * (value - originalValue - slope));
 			}
